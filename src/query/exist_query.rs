@@ -1,20 +1,41 @@
 use core::fmt::Debug;
 
 use columnar::{ColumnIndex, DynamicColumn};
+use common::BitSet;
 
 use super::{ConstScorer, EmptyScorer};
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentReader;
+use crate::query::all_query::AllScorer;
+use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::schema::Type;
 use crate::{DocId, Score, TantivyError};
 
-/// Query that matches all documents with a non-null value in the specified field.
+/// Query that matches all documents with a non-null value in the specified
+/// field.
+///
+/// When querying inside a JSON field, "exists" queries can be executed strictly
+/// on the field name or check all the subpaths. In that second case a document
+/// will be matched if a non-null value exists in any subpath. For example,
+/// assuming the following document where `myfield` is a JSON fast field:
+/// ```json
+/// {
+///   "myfield": {
+///     "mysubfield": "hello"
+///   }
+/// }
+/// ```
+/// With `json_subpaths` enabled queries on either `myfield` or
+/// `myfield.mysubfield` will match the document. If it is set to false, only
+/// `myfield.mysubfield` will match it.
 ///
 /// All of the matched documents get the score 1.0.
 #[derive(Clone, Debug)]
 pub struct ExistsQuery {
     field_name: String,
+    json_subpaths: bool,
 }
 
 impl ExistsQuery {
@@ -23,8 +44,28 @@ impl ExistsQuery {
     /// This query matches all documents with at least one non-null value in the specified field.
     /// This constructor never fails, but executing the search with this query will return an
     /// error if the specified field doesn't exists or is not a fast field.
+    #[deprecated]
     pub fn new_exists_query(field: String) -> ExistsQuery {
-        ExistsQuery { field_name: field }
+        ExistsQuery {
+            field_name: field,
+            json_subpaths: false,
+        }
+    }
+
+    /// Creates a new `ExistQuery` from the given field.
+    ///
+    /// This query matches all documents with at least one non-null value in the
+    /// specified field. If `json_subpaths` is set to true, documents with
+    /// non-null values in any JSON subpath will also be matched.
+    ///
+    /// This constructor never fails, but executing the search with this query will
+    /// return an error if the specified field doesn't exists or is not a fast
+    /// field.
+    pub fn new(field: String, json_subpaths: bool) -> Self {
+        Self {
+            field_name: field,
+            json_subpaths,
+        }
     }
 }
 
@@ -43,6 +84,8 @@ impl Query for ExistsQuery {
         }
         Ok(Box::new(ExistsWeight {
             field_name: self.field_name.clone(),
+            field_type: field_type.value_type(),
+            json_subpaths: self.json_subpaths,
         }))
     }
 }
@@ -50,13 +93,20 @@ impl Query for ExistsQuery {
 /// Weight associated with the `ExistsQuery` query.
 pub struct ExistsWeight {
     field_name: String,
+    field_type: Type,
+    json_subpaths: bool,
 }
 
 impl Weight for ExistsWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let fast_field_reader = reader.fast_fields();
-        let dynamic_columns: crate::Result<Vec<DynamicColumn>> = fast_field_reader
-            .dynamic_column_handles(&self.field_name)?
+        let mut column_handles = fast_field_reader.dynamic_column_handles(&self.field_name)?;
+        if self.field_type == Type::Json && self.json_subpaths {
+            let mut sub_columns =
+                fast_field_reader.dynamic_subpath_column_handles(&self.field_name)?;
+            column_handles.append(&mut sub_columns);
+        }
+        let dynamic_columns: crate::Result<Vec<DynamicColumn>> = column_handles
             .into_iter()
             .map(|handle| handle.open().map_err(|io_error| io_error.into()))
             .collect();
@@ -66,13 +116,49 @@ impl Weight for ExistsWeight {
                 non_empty_columns.push(column)
             }
         }
-        // TODO: we can optimizer more here since in most cases we will have only one index
-        if !non_empty_columns.is_empty() {
-            let docset = ExistsDocSet::new(non_empty_columns, reader.max_doc());
-            Ok(Box::new(ConstScorer::new(docset, boost)))
-        } else {
-            Ok(Box::new(EmptyScorer))
+        if non_empty_columns.is_empty() {
+            return Ok(Box::new(EmptyScorer));
         }
+
+        // If any column is full, all docs match.
+        let max_doc = reader.max_doc();
+        if non_empty_columns
+            .iter()
+            .any(|col| matches!(col.column_index(), ColumnIndex::Full))
+        {
+            let all_scorer = AllScorer::new(max_doc);
+            return Ok(Box::new(BoostScorer::new(all_scorer, boost)));
+        }
+
+        // If we have a single dynamic column, use ExistsDocSet
+        // NOTE: A lower number may be better for very sparse columns
+        if non_empty_columns.len() < 4 {
+            let docset = ExistsDocSet::new(non_empty_columns, reader.max_doc());
+            return Ok(Box::new(ConstScorer::new(docset, boost)));
+        }
+
+        // If we have many dynamic columns, precompute a bitset of matching docs
+        let mut doc_bitset = BitSet::with_max_value(max_doc);
+        for column in &non_empty_columns {
+            match column.column_index() {
+                ColumnIndex::Empty { .. } => {}
+                ColumnIndex::Full => {
+                    // Handled by AllScorer return above.
+                }
+                ColumnIndex::Optional(optional_index) => {
+                    for doc in optional_index.iter_non_null_docs() {
+                        doc_bitset.insert(doc);
+                    }
+                }
+                ColumnIndex::Multivalued(multi_idx) => {
+                    for doc in multi_idx.iter_non_null_docs() {
+                        doc_bitset.insert(doc);
+                    }
+                }
+            }
+        }
+        let docset = BitSetDocSet::from(doc_bitset);
+        Ok(Box::new(ConstScorer::new(docset, boost)))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -149,7 +235,7 @@ mod tests {
     use crate::query::exist_query::ExistsQuery;
     use crate::query::{BooleanQuery, RangeQuery};
     use crate::schema::{Facet, FacetOptions, Schema, FAST, INDEXED, STRING, TEXT};
-    use crate::{Index, Searcher};
+    use crate::{Index, Searcher, Term};
 
     #[test]
     fn test_exists_query_simple() -> crate::Result<()> {
@@ -180,30 +266,29 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        assert_eq!(count_existing_fields(&searcher, "all")?, 100);
-        assert_eq!(count_existing_fields(&searcher, "odd")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "even")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "multi")?, 10);
-        assert_eq!(count_existing_fields(&searcher, "never")?, 0);
+        assert_eq!(count_existing_fields(&searcher, "all", false)?, 100);
+        assert_eq!(count_existing_fields(&searcher, "odd", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "even", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "multi", false)?, 10);
+        assert_eq!(count_existing_fields(&searcher, "multi", true)?, 10);
+        assert_eq!(count_existing_fields(&searcher, "never", false)?, 0);
 
         // exercise seek
         let query = BooleanQuery::intersection(vec![
-            Box::new(RangeQuery::new_u64_bounds(
-                "all".to_string(),
-                Bound::Included(50),
+            Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_u64(all_field, 50)),
                 Bound::Unbounded,
             )),
-            Box::new(ExistsQuery::new_exists_query("even".to_string())),
+            Box::new(ExistsQuery::new("even".to_string(), false)),
         ]);
         assert_eq!(searcher.search(&query, &Count)?, 25);
 
         let query = BooleanQuery::intersection(vec![
-            Box::new(RangeQuery::new_u64_bounds(
-                "all".to_string(),
-                Bound::Included(0),
-                Bound::Excluded(50),
+            Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_u64(all_field, 0)),
+                Bound::Included(Term::from_field_u64(all_field, 50)),
             )),
-            Box::new(ExistsQuery::new_exists_query("odd".to_string())),
+            Box::new(ExistsQuery::new("odd".to_string(), false)),
         ]);
         assert_eq!(searcher.search(&query, &Count)?, 25);
 
@@ -232,22 +317,55 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        assert_eq!(count_existing_fields(&searcher, "json.all")?, 100);
-        assert_eq!(count_existing_fields(&searcher, "json.even")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "json.odd")?, 50);
+        assert_eq!(count_existing_fields(&searcher, "json.all", false)?, 100);
+        assert_eq!(count_existing_fields(&searcher, "json.even", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "json.even", true)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "json.odd", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "json", false)?, 0);
+        assert_eq!(count_existing_fields(&searcher, "json", true)?, 100);
 
         // Handling of non-existing fields:
-        assert_eq!(count_existing_fields(&searcher, "json.absent")?, 0);
-        assert_eq!(
-            searcher
-                .search(
-                    &ExistsQuery::new_exists_query("does_not_exists.absent".to_string()),
-                    &Count
-                )
-                .unwrap_err()
-                .to_string(),
-            "The field does not exist: 'does_not_exists.absent'"
-        );
+        assert_eq!(count_existing_fields(&searcher, "json.absent", false)?, 0);
+        assert_eq!(count_existing_fields(&searcher, "json.absent", true)?, 0);
+        assert_does_not_exist(&searcher, "does_not_exists.absent", true);
+        assert_does_not_exist(&searcher, "does_not_exists.absent", false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_exists_query_json_union_no_single_full_subpath() -> crate::Result<()> {
+        // Build docs where no single subpath exists for all docs, but the union does.
+        let mut schema_builder = Schema::builder();
+        let json = schema_builder.add_json_field("json", TEXT | FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for i in 0u64..100u64 {
+                if i % 2 == 0 {
+                    // only subpath `a`
+                    index_writer.add_document(doc!(json => json!({"a": i})))?;
+                } else {
+                    // only subpath `b`
+                    index_writer.add_document(doc!(json => json!({"b": i})))?;
+                }
+            }
+            index_writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // No single subpath is full
+        assert_eq!(count_existing_fields(&searcher, "json.a", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "json.b", false)?, 50);
+
+        // Root exists with subpaths disabled is zero
+        assert_eq!(count_existing_fields(&searcher, "json", false)?, 0);
+
+        // Root exists with subpaths enabled should match all docs via union
+        assert_eq!(count_existing_fields(&searcher, "json", true)?, 100);
 
         Ok(())
     }
@@ -286,12 +404,13 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        assert_eq!(count_existing_fields(&searcher, "bool")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "bytes")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "date")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "f64")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "ip_addr")?, 50);
-        assert_eq!(count_existing_fields(&searcher, "facet")?, 50);
+        assert_eq!(count_existing_fields(&searcher, "bool", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "bool", true)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "bytes", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "date", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "f64", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "ip_addr", false)?, 50);
+        assert_eq!(count_existing_fields(&searcher, "facet", false)?, 50);
 
         Ok(())
     }
@@ -315,31 +434,33 @@ mod tests {
 
         assert_eq!(
             searcher
-                .search(
-                    &ExistsQuery::new_exists_query("not_fast".to_string()),
-                    &Count
-                )
+                .search(&ExistsQuery::new("not_fast".to_string(), false), &Count)
                 .unwrap_err()
                 .to_string(),
             "Schema error: 'Field not_fast is not a fast field.'"
         );
 
-        assert_eq!(
-            searcher
-                .search(
-                    &ExistsQuery::new_exists_query("does_not_exists".to_string()),
-                    &Count
-                )
-                .unwrap_err()
-                .to_string(),
-            "The field does not exist: 'does_not_exists'"
-        );
+        assert_does_not_exist(&searcher, "does_not_exists", false);
 
         Ok(())
     }
 
-    fn count_existing_fields(searcher: &Searcher, field: &str) -> crate::Result<usize> {
-        let query = ExistsQuery::new_exists_query(field.to_string());
+    fn count_existing_fields(
+        searcher: &Searcher,
+        field: &str,
+        json_subpaths: bool,
+    ) -> crate::Result<usize> {
+        let query = ExistsQuery::new(field.to_string(), json_subpaths);
         searcher.search(&query, &Count)
+    }
+
+    fn assert_does_not_exist(searcher: &Searcher, field: &str, json_subpaths: bool) {
+        assert_eq!(
+            searcher
+                .search(&ExistsQuery::new(field.to_string(), json_subpaths), &Count)
+                .unwrap_err()
+                .to_string(),
+            format!("The field does not exist: '{field}'")
+        );
     }
 }

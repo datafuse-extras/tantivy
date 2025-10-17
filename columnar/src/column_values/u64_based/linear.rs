@@ -1,13 +1,13 @@
 use std::io;
 
 use common::{BinarySerializable, OwnedBytes};
-use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
+use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 
-use super::line::Line;
 use super::ColumnValues;
-use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
-use crate::column_values::VecColumn;
+use super::line::Line;
 use crate::RowId;
+use crate::column_values::VecColumn;
+use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 
 const HALF_SPACE: u64 = u64::MAX / 2;
 const LINE_ESTIMATION_BLOCK_LEN: usize = 512;
@@ -117,7 +117,7 @@ impl ColumnCodecEstimator for LinearCodecEstimator {
         Some(
             stats.num_bytes()
                 + linear_params.num_bytes()
-                + (num_bits as u64 * stats.num_rows as u64 + 7) / 8,
+                + (num_bits as u64 * stats.num_rows as u64).div_ceil(8),
         )
     }
 

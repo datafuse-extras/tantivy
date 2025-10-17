@@ -1,14 +1,14 @@
 use super::agg_req::Aggregations;
-use super::agg_req_with_accessor::AggregationsWithAccessor;
 use super::agg_result::AggregationResults;
 use super::buf_collector::BufAggregationCollector;
 use super::intermediate_agg_result::IntermediateAggregationResults;
-use super::segment_agg_result::{
-    build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
+use super::segment_agg_result::{AggregationLimitsGuard, SegmentAggregationCollector};
+use crate::aggregation::agg_data::{
+    build_aggregations_data_from_req, build_segment_agg_collectors_root, AggregationsSegmentCtx,
 };
-use crate::aggregation::agg_req_with_accessor::get_aggs_with_segment_accessor_and_validate;
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocId, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::index::SegmentReader;
+use crate::{DocId, SegmentOrdinal, TantivyError};
 
 /// The default max bucket count, before the aggregation fails.
 pub const DEFAULT_BUCKET_LIMIT: u32 = 65000;
@@ -21,7 +21,7 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 500_000_000;
 /// The collector collects all aggregations by the underlying aggregation request.
 pub struct AggregationCollector {
     agg: Aggregations,
-    limits: AggregationLimits,
+    limits: AggregationLimitsGuard,
 }
 
 impl AggregationCollector {
@@ -29,7 +29,7 @@ impl AggregationCollector {
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimits) -> Self {
+    pub fn from_aggs(agg: Aggregations, limits: AggregationLimitsGuard) -> Self {
         Self { agg, limits }
     }
 }
@@ -44,7 +44,7 @@ impl AggregationCollector {
 /// into the final `AggregationResults` via the `into_final_result()` method.
 pub struct DistributedAggregationCollector {
     agg: Aggregations,
-    limits: AggregationLimits,
+    limits: AggregationLimitsGuard,
 }
 
 impl DistributedAggregationCollector {
@@ -52,7 +52,7 @@ impl DistributedAggregationCollector {
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimits) -> Self {
+    pub fn from_aggs(agg: Aggregations, limits: AggregationLimitsGuard) -> Self {
         Self { agg, limits }
     }
 }
@@ -114,7 +114,7 @@ impl Collector for AggregationCollector {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
         let res = merge_fruits(segment_fruits)?;
-        res.into_final_result(self.agg.clone(), &self.limits)
+        res.into_final_result(self.agg.clone(), self.limits.clone())
     }
 }
 
@@ -134,7 +134,7 @@ fn merge_fruits(
 
 /// `AggregationSegmentCollector` does the aggregation collection on a segment.
 pub struct AggregationSegmentCollector {
-    aggs_with_accessor: AggregationsWithAccessor,
+    aggs_with_accessor: AggregationsSegmentCtx,
     agg_collector: BufAggregationCollector,
     error: Option<TantivyError>,
 }
@@ -146,14 +146,15 @@ impl AggregationSegmentCollector {
         agg: &Aggregations,
         reader: &SegmentReader,
         segment_ordinal: SegmentOrdinal,
-        limits: &AggregationLimits,
+        limits: &AggregationLimitsGuard,
     ) -> crate::Result<Self> {
-        let mut aggs_with_accessor =
-            get_aggs_with_segment_accessor_and_validate(agg, reader, segment_ordinal, limits)?;
+        let mut agg_data =
+            build_aggregations_data_from_req(agg, reader, segment_ordinal, limits.clone())?;
         let result =
-            BufAggregationCollector::new(build_segment_agg_collector(&mut aggs_with_accessor)?);
+            BufAggregationCollector::new(build_segment_agg_collectors_root(&mut agg_data)?);
+
         Ok(AggregationSegmentCollector {
-            aggs_with_accessor,
+            aggs_with_accessor: agg_data,
             agg_collector: result,
             error: None,
         })

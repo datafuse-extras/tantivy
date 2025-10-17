@@ -1,4 +1,5 @@
 //! Contains the final aggregation tree.
+//!
 //! This tree can be converted via the `into()` method from `IntermediateAggregationResults`.
 //! This conversion computes the final result. For example: The intermediate result contains
 //! intermediate average results, which is the sum and the number of values. The actual average is
@@ -8,7 +9,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::bucket::GetDocCount;
-use super::metric::{PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult};
+use super::metric::{
+    ExtendedStats, PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult,
+};
 use super::{AggregationError, Key};
 use crate::TantivyError;
 
@@ -88,12 +91,16 @@ pub enum MetricResult {
     Min(SingleMetricResult),
     /// Stats metric result.
     Stats(Stats),
+    /// ExtendedStats metric result.
+    ExtendedStats(Box<ExtendedStats>),
     /// Sum metric result.
     Sum(SingleMetricResult),
     /// Percentiles metric result.
     Percentiles(PercentilesMetricResult),
     /// Top hits metric result
     TopHits(TopHitsMetricResult),
+    /// Cardinality metric result
+    Cardinality(SingleMetricResult),
 }
 
 impl MetricResult {
@@ -104,6 +111,7 @@ impl MetricResult {
             MetricResult::Max(max) => Ok(max.value),
             MetricResult::Min(min) => Ok(min.value),
             MetricResult::Stats(stats) => stats.get_value(agg_property),
+            MetricResult::ExtendedStats(extended_stats) => extended_stats.get_value(agg_property),
             MetricResult::Sum(sum) => Ok(sum.value),
             MetricResult::Percentiles(_) => Err(TantivyError::AggregationError(
                 AggregationError::InvalidRequest("percentiles can't be used to order".to_string()),
@@ -111,6 +119,7 @@ impl MetricResult {
             MetricResult::TopHits(_) => Err(TantivyError::AggregationError(
                 AggregationError::InvalidRequest("top_hits can't be used to order".to_string()),
             )),
+            MetricResult::Cardinality(card) => Ok(card.value),
         }
     }
 }
@@ -179,7 +188,7 @@ pub enum BucketEntries<T> {
 }
 
 impl<T> BucketEntries<T> {
-    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &T> + 'a> {
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + 'a> {
         match self {
             BucketEntries::Vec(vec) => Box::new(vec.iter()),
             BucketEntries::HashMap(map) => Box::new(map.values()),

@@ -1,12 +1,18 @@
 use std::io;
 
-use common::BinarySerializable;
-use fnv::FnvHashSet;
+use common::json_path_writer::JSON_END_OF_PATH;
+use common::{BinarySerializable, ByteCount};
+#[cfg(feature = "quickwit")]
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
+#[cfg(feature = "quickwit")]
+use itertools::Itertools;
+#[cfg(feature = "quickwit")]
+use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
 use crate::positions::PositionReader;
 use crate::postings::{BlockSegmentPostings, SegmentPostings, TermInfo};
-use crate::schema::{IndexRecordOption, Term, Type, JSON_END_OF_PATH};
+use crate::schema::{IndexRecordOption, Term, Type};
 use crate::termdict::TermDictionary;
 
 /// The inverted index reader is in charge of accessing
@@ -29,8 +35,34 @@ pub struct InvertedIndexReader {
     total_num_tokens: u64,
 }
 
+/// Object that records the amount of space used by a field in an inverted index.
+pub(crate) struct InvertedIndexFieldSpace {
+    pub field_name: String,
+    pub field_type: Type,
+    pub postings_size: ByteCount,
+    pub positions_size: ByteCount,
+    pub num_terms: u64,
+}
+
+/// Returns None if the term is not a valid JSON path.
+fn extract_field_name_and_field_type_from_json_path(term: &[u8]) -> Option<(String, Type)> {
+    let index = term.iter().position(|&byte| byte == JSON_END_OF_PATH)?;
+    let field_type_code = term.get(index + 1).copied()?;
+    let field_type = Type::from_code(field_type_code)?;
+    // Let's flush the current field.
+    let field_name = String::from_utf8_lossy(&term[..index]).to_string();
+    Some((field_name, field_type))
+}
+
+impl InvertedIndexFieldSpace {
+    fn record(&mut self, term_info: &TermInfo) {
+        self.postings_size += ByteCount::from(term_info.posting_num_bytes() as u64);
+        self.positions_size += ByteCount::from(term_info.positions_num_bytes() as u64);
+        self.num_terms += 1;
+    }
+}
+
 impl InvertedIndexReader {
-    #[allow(clippy::needless_pass_by_value)] // for symmetry
     pub(crate) fn new(
         termdict: TermDictionary,
         postings_file_slice: FileSlice,
@@ -70,24 +102,60 @@ impl InvertedIndexReader {
         &self.termdict
     }
 
-    /// Return the fields and types encoded in the dictionary in lexicographic oder.
+    /// Return the fields and types encoded in the dictionary in lexicographic order.
     /// Only valid on JSON fields.
     ///
     /// Notice: This requires a full scan and therefore **very expensive**.
     /// TODO: Move to sstable to use the index.
-    pub fn list_encoded_fields(&self) -> io::Result<Vec<(String, Type)>> {
+    pub(crate) fn list_encoded_json_fields(&self) -> io::Result<Vec<InvertedIndexFieldSpace>> {
         let mut stream = self.termdict.stream()?;
-        let mut fields = Vec::new();
-        let mut fields_set = FnvHashSet::default();
-        while let Some((term, _term_info)) = stream.next() {
-            if let Some(index) = term.iter().position(|&byte| byte == JSON_END_OF_PATH) {
-                if !fields_set.contains(&term[..index + 2]) {
-                    fields_set.insert(term[..index + 2].to_vec());
-                    let typ = Type::from_code(term[index + 1]).unwrap();
-                    fields.push((String::from_utf8_lossy(&term[..index]).to_string(), typ));
+        let mut fields: Vec<InvertedIndexFieldSpace> = Vec::new();
+
+        let mut current_field_opt: Option<InvertedIndexFieldSpace> = None;
+        // Current field bytes, including the JSON_END_OF_PATH.
+        let mut current_field_bytes: Vec<u8> = Vec::new();
+
+        while let Some((term, term_info)) = stream.next() {
+            if let Some(current_field) = &mut current_field_opt {
+                if term.starts_with(&current_field_bytes) {
+                    // We are still in the same field.
+                    current_field.record(term_info);
+                    continue;
                 }
             }
+
+            // This is a new field!
+            // Let's flush the current field.
+            fields.extend(current_field_opt.take());
+            current_field_bytes.clear();
+
+            // And create a new one.
+            let Some((field_name, field_type)) =
+                extract_field_name_and_field_type_from_json_path(term)
+            else {
+                error!(
+                    "invalid term bytes encountered {term:?}. this only happens if the term \
+                     dictionary is corrupted. please report"
+                );
+                continue;
+            };
+            let mut field_space = InvertedIndexFieldSpace {
+                field_name,
+                field_type,
+                postings_size: ByteCount::default(),
+                positions_size: ByteCount::default(),
+                num_terms: 0u64,
+            };
+            field_space.record(term_info);
+
+            // We include the json type and the json end of path to make sure the prefix check
+            // is meaningful.
+            current_field_bytes.extend_from_slice(&term[..field_space.field_name.len() + 2]);
+            current_field_opt = Some(field_space);
         }
+
+        // We need to flush the last field as well.
+        fields.extend(current_field_opt.take());
 
         Ok(fields)
     }
@@ -204,16 +272,6 @@ impl InvertedIndexReader {
             .transpose()
     }
 
-    pub(crate) fn read_postings_no_deletes(
-        &self,
-        term: &Term,
-        option: IndexRecordOption,
-    ) -> io::Result<Option<SegmentPostings>> {
-        self.get_term_info(term)?
-            .map(|term_info| self.read_postings_from_terminfo(&term_info, option))
-            .transpose()
-    }
-
     /// Returns the number of documents containing the term.
     pub fn doc_freq(&self, term: &Term) -> io::Result<u32> {
         Ok(self
@@ -229,13 +287,18 @@ impl InvertedIndexReader {
         self.termdict.get_async(term.serialized_value_bytes()).await
     }
 
-    async fn get_term_range_async(
-        &self,
+    async fn get_term_range_async<'a, A: Automaton + 'a>(
+        &'a self,
         terms: impl std::ops::RangeBounds<Term>,
+        automaton: A,
         limit: Option<u64>,
-    ) -> io::Result<impl Iterator<Item = TermInfo> + '_> {
+        merge_holes_under_bytes: usize,
+    ) -> io::Result<impl Iterator<Item = TermInfo> + 'a>
+    where
+        A::State: Clone,
+    {
         use std::ops::Bound;
-        let range_builder = self.termdict.range();
+        let range_builder = self.termdict.search(automaton);
         let range_builder = match terms.start_bound() {
             Bound::Included(bound) => range_builder.ge(bound.serialized_value_bytes()),
             Bound::Excluded(bound) => range_builder.gt(bound.serialized_value_bytes()),
@@ -252,7 +315,9 @@ impl InvertedIndexReader {
             range_builder
         };
 
-        let mut stream = range_builder.into_stream_async().await?;
+        let mut stream = range_builder
+            .into_stream_async_merging_holes(merge_holes_under_bytes)
+            .await?;
 
         let iter = std::iter::from_fn(move || stream.next().map(|(_k, v)| v.clone()));
 
@@ -298,7 +363,9 @@ impl InvertedIndexReader {
         limit: Option<u64>,
         with_positions: bool,
     ) -> io::Result<bool> {
-        let mut term_info = self.get_term_range_async(terms, limit).await?;
+        let mut term_info = self
+            .get_term_range_async(terms, AlwaysMatch, limit, 0)
+            .await?;
 
         let Some(first_terminfo) = term_info.next() else {
             // no key matches, nothing more to load
@@ -323,6 +390,84 @@ impl InvertedIndexReader {
             postings.await?;
         }
         Ok(true)
+    }
+
+    /// Warmup a block postings given a range of `Term`s.
+    /// This method is for an advanced usage only.
+    ///
+    /// returns a boolean, whether a term matching the range was found in the dictionary
+    pub async fn warm_postings_automaton<
+        A: Automaton + Clone + Send + 'static,
+        E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        F: std::future::Future<Output = io::Result<()>>,
+    >(
+        &self,
+        automaton: A,
+        // with_positions: bool, at the moment we have no use for it, and supporting it would add
+        // complexity to the coalesce
+        executor: E,
+    ) -> io::Result<bool>
+    where
+        A::State: Clone,
+    {
+        // merge holes under 4MiB, that's how many bytes we can hope to receive during a TTFB from
+        // S3 (~80MiB/s, and 50ms latency)
+        const MERGE_HOLES_UNDER_BYTES: usize = (80 * 1024 * 1024 * 50) / 1000;
+        // we build a first iterator to download everything. Simply calling the function already
+        // download everything we need from the sstable, but doesn't start iterating over it.
+        let _term_info_iter = self
+            .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
+            .await?;
+
+        let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
+        let termdict = self.termdict.clone();
+        let cpu_bound_task = move || {
+            // then we build a 2nd iterator, this one with no holes, so we don't go through blocks
+            // we can't match.
+            // This makes the assumption there is a caching layer below us, which gives sync read
+            // for free after the initial async access. This might not always be true, but is in
+            // Quickwit.
+            // We build things from this closure otherwise we get into lifetime issues that can only
+            // be solved with self referential strucs. Returning an io::Result from here is a bit
+            // more leaky abstraction-wise, but a lot better than the alternative
+            let mut stream = termdict.search(automaton).into_stream()?;
+
+            // we could do without an iterator, but this allows us access to coalesce which simplify
+            // things
+            let posting_ranges_iter =
+                std::iter::from_fn(move || stream.next().map(|(_k, v)| v.postings_range.clone()));
+
+            let merged_posting_ranges_iter = posting_ranges_iter.coalesce(|range1, range2| {
+                if range1.end + MERGE_HOLES_UNDER_BYTES >= range2.start {
+                    Ok(range1.start..range2.end)
+                } else {
+                    Err((range1, range2))
+                }
+            });
+
+            for posting_range in merged_posting_ranges_iter {
+                if let Err(_) = sender.unbounded_send(posting_range) {
+                    // this should happen only when search is cancelled
+                    return Err(io::Error::other("failed to send posting range back"));
+                }
+            }
+            Ok(())
+        };
+        let task_handle = executor(Box::new(cpu_bound_task));
+
+        let posting_downloader = posting_ranges_to_load_stream
+            .map(|posting_slice| {
+                self.postings_file_slice
+                    .read_bytes_slice_async(posting_slice)
+                    .map(|result| result.map(|_slice| ()))
+            })
+            .buffer_unordered(5)
+            .try_collect::<Vec<()>>();
+
+        let (_, slices_downloaded) =
+            futures_util::future::try_join(task_handle, posting_downloader).await?;
+
+        Ok(!slices_downloaded.is_empty())
     }
 
     /// Warmup the block postings for all terms.

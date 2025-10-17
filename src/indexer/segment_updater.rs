@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::io::Write;
@@ -23,17 +24,15 @@ use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
     SegmentSerializer,
 };
-use crate::{FutureResult, Opstamp};
+use crate::{FutureResult, Opstamp, TantivyError};
 
-const NUM_MERGE_THREADS: usize = 4;
+const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 
 /// Save the index meta file.
 /// This operation is atomic:
 /// Either
-///  - it fails, in which case an error is returned,
-/// and the `meta.json` remains untouched,
-/// - it success, and `meta.json` is written
-/// and flushed.
+/// - it fails, in which case an error is returned, and the `meta.json` remains untouched,
+/// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
 pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
@@ -115,11 +114,10 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger =
-        IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
+    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone(), true)?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
 
     let num_docs = merger.write(segment_serializer)?;
 
@@ -220,13 +218,9 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     )?;
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
-        merged_index.schema(),
-        merged_index.settings().clone(),
-        segments,
-        filter_doc_ids,
-    )?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment, true)?;
+    let merger: IndexMerger =
+        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
     let num_docs = merger.write(segment_serializer)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
@@ -280,6 +274,7 @@ impl SegmentUpdater {
         index: Index,
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
+        num_merge_threads: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -294,7 +289,16 @@ impl SegmentUpdater {
             })?;
         let merge_thread_pool = ThreadPoolBuilder::new()
             .thread_name(|i| format!("merge_thread_{i}"))
-            .num_threads(NUM_MERGE_THREADS)
+            .num_threads(num_merge_threads)
+            .panic_handler(move |panic| {
+                // We don't print the panic content itself,
+                // it is already printed during the unwinding
+                if let Some(message) = panic.downcast_ref::<&str>() {
+                    if *message != PANIC_CAUGHT {
+                        error!("uncaught merge panic")
+                    }
+                }
+            })
             .build()
             .map_err(|_| {
                 crate::TantivyError::SystemError(
@@ -384,7 +388,7 @@ impl SegmentUpdater {
         if self.is_alive() {
             let index = &self.index;
             let directory = index.directory();
-            let mut commited_segment_metas = self.segment_manager.committed_segment_metas();
+            let mut committed_segment_metas = self.segment_manager.committed_segment_metas();
 
             // We sort segment_readers by number of documents.
             // This is an heuristic to make multithreading more efficient.
@@ -399,10 +403,10 @@ impl SegmentUpdater {
             // from the different drives.
             //
             // Segment 1 from disk 1, Segment 1 from disk 2, etc.
-            commited_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
+            committed_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
-                segments: commited_segment_metas,
+                segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
                 payload: commit_message,
@@ -497,8 +501,7 @@ impl SegmentUpdater {
             Ok(segment_entries) => segment_entries,
             Err(err) => {
                 warn!(
-                    "Starting the merge failed for the following reason. This is not fatal. {}",
-                    err
+                    "Starting the merge failed for the following reason. This is not fatal. {err}"
                 );
                 return err.into();
             }
@@ -514,11 +517,34 @@ impl SegmentUpdater {
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
             // candidate for another merge.
-            match merge(
-                &segment_updater.index,
-                segment_entries,
-                merge_operation.target_opstamp(),
-            ) {
+            let merge_panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                merge(
+                    &segment_updater.index,
+                    segment_entries,
+                    merge_operation.target_opstamp(),
+                )
+            }));
+            let merge_res = match merge_panic_res {
+                Ok(merge_res) => merge_res,
+                Err(panic_err) => {
+                    let panic_str = if let Some(msg) = panic_err.downcast_ref::<&str>() {
+                        *msg
+                    } else if let Some(msg) = panic_err.downcast_ref::<String>() {
+                        msg.as_str()
+                    } else {
+                        "UNKNOWN"
+                    };
+                    let _send_result = merging_future_send.send(Err(TantivyError::SystemError(
+                        format!("Merge thread panicked: {panic_str}"),
+                    )));
+                    // Resume unwinding because we forced unwind safety with
+                    // `std::panic::AssertUnwindSafe` Use a specific message so
+                    // the panic_handler can double check that we properly caught the panic.
+                    let boxed_panic_message: Box<dyn Any + Send> = Box::new(PANIC_CAUGHT);
+                    std::panic::resume_unwind(boxed_panic_message);
+                }
+            };
+            match merge_res {
                 Ok(after_merge_segment_entry) => {
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
                     let _send_result = merging_future_send.send(res);
@@ -547,7 +573,13 @@ impl SegmentUpdater {
     }
 
     fn consider_merge_options(&self) {
-        let (committed_segments, uncommitted_segments) = self.get_mergeable_segments();
+        let (mut committed_segments, mut uncommitted_segments) = self.get_mergeable_segments();
+        if committed_segments.len() == 1 && committed_segments[0].num_deleted_docs() == 0 {
+            committed_segments.clear();
+        }
+        if uncommitted_segments.len() == 1 && uncommitted_segments[0].num_deleted_docs() == 0 {
+            uncommitted_segments.clear();
+        }
 
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.
@@ -1067,7 +1099,6 @@ mod tests {
             )?;
             let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
-                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
             )?;
@@ -1083,7 +1114,6 @@ mod tests {
                 Index::create(RamDirectory::default(), target_schema, target_settings)?;
             let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
-                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
             )?;

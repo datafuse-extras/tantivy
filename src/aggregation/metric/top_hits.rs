@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 
-use columnar::{ColumnarReader, DynamicColumn};
+use columnar::{Column, ColumnType, ColumnarReader, DynamicColumn};
+use common::json_path_writer::JSON_PATH_SEGMENT_SEP_STR;
 use common::DateTime;
 use regex::Regex;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{TopHitsMetricResult, TopHitsVecEntry};
+use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::bucket::Order;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateMetricResult,
@@ -15,9 +17,32 @@ use crate::aggregation::intermediate_agg_result::{
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::aggregation::AggregationError;
 use crate::collector::TopNComputer;
-use crate::schema::term::JSON_PATH_SEGMENT_SEP_STR;
 use crate::schema::OwnedValue;
 use crate::{DocAddress, DocId, SegmentOrdinal};
+// duplicate import removed; already imported above
+
+/// Contains all information required by the TopHitsSegmentCollector to perform the
+/// top_hits aggregation on a segment.
+#[derive(Default)]
+pub struct TopHitsAggReqData {
+    /// The accessors to access the fast field values.
+    pub accessors: Vec<(Column<u64>, ColumnType)>,
+    /// The accessors to access the fast field values for retrieving document fields.
+    pub value_accessors: HashMap<String, Vec<DynamicColumn>>,
+    /// The ordinal of the segment this request data is for.
+    pub segment_ordinal: SegmentOrdinal,
+    /// The name of the aggregation.
+    pub name: String,
+    /// The top_hits aggregation request.
+    pub req: TopHitsAggregationReq,
+}
+
+impl TopHitsAggReqData {
+    /// Estimate the memory consumption of this struct in bytes.
+    pub fn get_memory_consumption(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
 
 /// # Top Hits
 ///
@@ -89,7 +114,7 @@ use crate::{DocAddress, DocId, SegmentOrdinal};
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct TopHitsAggregation {
+pub struct TopHitsAggregationReq {
     sort: Vec<KeyOrder>,
     size: usize,
     from: Option<usize>,
@@ -131,45 +156,40 @@ impl<'de> Deserialize<'de> for KeyOrder {
         ))?;
         if key_order.next().is_some() {
             return Err(serde::de::Error::custom(format!(
-                "Expected exactly one key-value pair in sort parameter of top_hits, found {:?}",
-                key_order
+                "Expected exactly one key-value pair in sort parameter of top_hits, found \
+                 {key_order:?}"
             )));
         }
         Ok(Self { field, order })
     }
 }
 
-// Tranform a glob (`pattern*`, for example) into a regex::Regex (`^pattern.*$`)
+// Transform a glob (`pattern*`, for example) into a regex::Regex (`^pattern.*$`)
 fn globbed_string_to_regex(glob: &str) -> Result<Regex, crate::TantivyError> {
     // Replace `*` glob with `.*` regex
     let sanitized = format!("^{}$", regex::escape(glob).replace(r"\*", ".*"));
     Regex::new(&sanitized.replace('*', ".*")).map_err(|e| {
-        crate::TantivyError::SchemaError(format!(
-            "Invalid regex '{}' in docvalue_fields: {}",
-            glob, e
-        ))
+        crate::TantivyError::SchemaError(format!("Invalid regex '{glob}' in docvalue_fields: {e}"))
     })
 }
 
 fn use_doc_value_fields_err(parameter: &str) -> crate::Result<()> {
     Err(crate::TantivyError::AggregationError(
         AggregationError::InvalidRequest(format!(
-            "The `{}` parameter is not supported, only `docvalue_fields` is supported in \
-             `top_hits` aggregation",
-            parameter
+            "The `{parameter}` parameter is not supported, only `docvalue_fields` is supported in \
+             `top_hits` aggregation"
         )),
     ))
 }
 fn unsupported_err(parameter: &str) -> crate::Result<()> {
     Err(crate::TantivyError::AggregationError(
         AggregationError::InvalidRequest(format!(
-            "The `{}` parameter is not supported in the `top_hits` aggregation",
-            parameter
+            "The `{parameter}` parameter is not supported in the `top_hits` aggregation"
         )),
     ))
 }
 
-impl TopHitsAggregation {
+impl TopHitsAggregationReq {
     /// Validate and resolve field retrieval parameters
     pub fn validate_and_resolve_field_names(
         &mut self,
@@ -217,8 +237,7 @@ impl TopHitsAggregation {
                     .collect::<Vec<_>>();
                 assert!(
                     !fields.is_empty(),
-                    "No fields matched the glob '{}' in docvalue_fields",
-                    field
+                    "No fields matched the glob '{field}' in docvalue_fields"
                 );
                 Ok(fields)
             })
@@ -235,6 +254,7 @@ impl TopHitsAggregation {
         self.sort
             .iter()
             .map(|KeyOrder { field, .. }| field.as_str())
+            .chain(self.doc_value_fields.iter().map(|s| s.as_str()))
             .collect()
     }
 
@@ -254,7 +274,7 @@ impl TopHitsAggregation {
             .map(|field| {
                 let accessors = accessors
                     .get(field)
-                    .unwrap_or_else(|| panic!("field '{}' not found in accessors", field));
+                    .unwrap_or_else(|| panic!("field '{field}' not found in accessors"));
 
                 let values: Vec<FastFieldValue> = accessors
                     .iter()
@@ -437,7 +457,7 @@ impl Eq for DocSortValuesAndFields {}
 /// The TopHitsCollector used for collecting over segments and merging results.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TopHitsTopNComputer {
-    req: TopHitsAggregation,
+    req: TopHitsAggregationReq,
     top_n: TopNComputer<DocSortValuesAndFields, DocAddress, false>,
 }
 
@@ -449,10 +469,10 @@ impl std::cmp::PartialEq for TopHitsTopNComputer {
 
 impl TopHitsTopNComputer {
     /// Create a new TopHitsCollector
-    pub fn new(req: TopHitsAggregation) -> Self {
+    pub fn new(req: &TopHitsAggregationReq) -> Self {
         Self {
             top_n: TopNComputer::new(req.size + req.from.unwrap_or(0)),
-            req,
+            req: req.clone(),
         }
     }
 
@@ -497,18 +517,16 @@ impl TopHitsTopNComputer {
 pub(crate) struct TopHitsSegmentCollector {
     segment_ordinal: SegmentOrdinal,
     accessor_idx: usize,
-    req: TopHitsAggregation,
     top_n: TopNComputer<Vec<DocValueAndOrder>, DocAddress, false>,
 }
 
 impl TopHitsSegmentCollector {
     pub fn from_req(
-        req: &TopHitsAggregation,
+        req: &TopHitsAggregationReq,
         accessor_idx: usize,
         segment_ordinal: SegmentOrdinal,
     ) -> Self {
         Self {
-            req: req.clone(),
             top_n: TopNComputer::new(req.size + req.from.unwrap_or(0)),
             segment_ordinal,
             accessor_idx,
@@ -517,14 +535,13 @@ impl TopHitsSegmentCollector {
     fn into_top_hits_collector(
         self,
         value_accessors: &HashMap<String, Vec<DynamicColumn>>,
+        req: &TopHitsAggregationReq,
     ) -> TopHitsTopNComputer {
-        let mut top_hits_computer = TopHitsTopNComputer::new(self.req.clone());
+        let mut top_hits_computer = TopHitsTopNComputer::new(req);
         let top_results = self.top_n.into_vec();
 
         for res in top_results {
-            let doc_value_fields = self
-                .req
-                .get_document_field_data(value_accessors, res.doc.doc_id);
+            let doc_value_fields = req.get_document_field_data(value_accessors, res.doc.doc_id);
             top_hits_computer.collect(
                 DocSortValuesAndFields {
                     sorts: res.feature,
@@ -536,34 +553,15 @@ impl TopHitsSegmentCollector {
 
         top_hits_computer
     }
-}
 
-impl SegmentAggregationCollector for TopHitsSegmentCollector {
-    fn add_intermediate_aggregation_result(
-        self: Box<Self>,
-        agg_with_accessor: &crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
-        results: &mut crate::aggregation::intermediate_agg_result::IntermediateAggregationResults,
-    ) -> crate::Result<()> {
-        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
-
-        let value_accessors = &agg_with_accessor.aggs.values[self.accessor_idx].value_accessors;
-
-        let intermediate_result =
-            IntermediateMetricResult::TopHits(self.into_top_hits_collector(value_accessors));
-        results.push(
-            name,
-            IntermediateAggregationResult::Metric(intermediate_result),
-        )
-    }
-
-    fn collect(
+    /// TODO add a specialized variant for a single sort field
+    fn collect_with(
         &mut self,
         doc_id: crate::DocId,
-        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
+        req: &TopHitsAggregationReq,
+        accessors: &[(Column<u64>, ColumnType)],
     ) -> crate::Result<()> {
-        let accessors = &agg_with_accessor.aggs.values[self.accessor_idx].accessors;
-        let sorts: Vec<DocValueAndOrder> = self
-            .req
+        let sorts: Vec<DocValueAndOrder> = req
             .sort
             .iter()
             .enumerate()
@@ -588,15 +586,47 @@ impl SegmentAggregationCollector for TopHitsSegmentCollector {
         );
         Ok(())
     }
+}
+
+impl SegmentAggregationCollector for TopHitsSegmentCollector {
+    fn add_intermediate_aggregation_result(
+        self: Box<Self>,
+        agg_data: &AggregationsSegmentCtx,
+        results: &mut crate::aggregation::intermediate_agg_result::IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        let req_data = agg_data.get_top_hits_req_data(self.accessor_idx);
+
+        let value_accessors = &req_data.value_accessors;
+
+        let intermediate_result = IntermediateMetricResult::TopHits(
+            self.into_top_hits_collector(value_accessors, &req_data.req),
+        );
+        results.push(
+            req_data.name.to_string(),
+            IntermediateAggregationResult::Metric(intermediate_result),
+        )
+    }
+
+    /// TODO: Consider a caching layer to reduce the call overhead
+    fn collect(
+        &mut self,
+        doc_id: crate::DocId,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        let req_data = agg_data.get_top_hits_req_data(self.accessor_idx);
+        self.collect_with(doc_id, &req_data.req, &req_data.accessors)?;
+        Ok(())
+    }
 
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
+        agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
+        let req_data = agg_data.get_top_hits_req_data(self.accessor_idx);
         // TODO: Consider getting fields with the column block accessor.
         for doc in docs {
-            self.collect(*doc, agg_with_accessor)?;
+            self.collect_with(*doc, &req_data.req, &req_data.accessors)?;
         }
         Ok(())
     }

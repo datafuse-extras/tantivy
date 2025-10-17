@@ -1,9 +1,46 @@
+//! `tantivy_sstable` is a crate that provides a sorted string table data structure.
+//!
+//! It is used in `tantivy` to store the term dictionary.
+//!
+//! A `sstable` is a map of sorted `&[u8]` keys to values.
+//! The keys are encoded using incremental encoding.
+//!
+//! Values and keys are compressed using zstd with the default feature flag `zstd-compression`.
+//!
+//! # Example
+//!
+//! Here is an example of how to create and search an `sstable`:
+//!
+//! ```rust
+//! use common::OwnedBytes;
+//! use tantivy_sstable::{Dictionary, MonotonicU64SSTable};
+//!
+//! // Create a new sstable in memory.
+//! let mut builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new()).unwrap();
+//! builder.insert(b"apple", &1).unwrap();
+//! builder.insert(b"banana", &2).unwrap();
+//! builder.insert(b"orange", &3).unwrap();
+//! let sstable_bytes = builder.finish().unwrap();
+//!
+//! // Open the sstable.
+//! let sstable =
+//!     Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(sstable_bytes)).unwrap();
+//!
+//! // Search for a key.
+//! let value = sstable.get(b"banana").unwrap();
+//! assert_eq!(value, Some(2));
+//!
+//! // Search for a non-existent key.
+//! let value = sstable.get(b"grape").unwrap();
+//! assert_eq!(value, None);
+//! ```
+
 use std::io::{self, Write};
 use std::ops::Range;
-use std::usize;
 
 use merge::ValueMerger;
 
+mod block_match_automaton;
 mod delta;
 mod dictionary;
 pub mod merge;
@@ -19,6 +56,7 @@ pub use streamer::{Streamer, StreamerBuilder};
 
 mod block_reader;
 use common::{BinarySerializable, OwnedBytes};
+use value::{VecU32ValueReader, VecU32ValueWriter};
 
 pub use self::block_reader::BlockReader;
 pub use self::delta::{DeltaReader, DeltaWriter};
@@ -86,7 +124,6 @@ pub trait SSTable: Sized {
     }
 }
 
-#[allow(dead_code)]
 pub struct VoidSSTable;
 
 impl SSTable for VoidSSTable {
@@ -101,7 +138,6 @@ impl SSTable for VoidSSTable {
 /// In other words, two keys `k1` and `k2`
 /// such that `k1` <= `k2`, are required to observe
 /// `range_sstable[k1] <= range_sstable[k2]`.
-#[allow(dead_code)]
 pub struct MonotonicU64SSTable;
 
 impl SSTable for MonotonicU64SSTable {
@@ -130,6 +166,15 @@ impl SSTable for RangeSSTable {
     type ValueReader = RangeValueReader;
 
     type ValueWriter = RangeValueWriter;
+}
+
+/// SSTable associating keys to Vec<u32>.
+pub struct VecU32ValueSSTable;
+
+impl SSTable for VecU32ValueSSTable {
+    type Value = Vec<u32>;
+    type ValueReader = VecU32ValueReader;
+    type ValueWriter = VecU32ValueWriter;
 }
 
 /// SSTable reader.
@@ -324,7 +369,7 @@ mod test {
 
     use common::OwnedBytes;
 
-    use super::{common_prefix_len, MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable};
+    use super::{MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable, common_prefix_len};
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(
@@ -387,7 +432,7 @@ mod test {
                 16, 17, 33, 18, 19, 17, 20, // data block
                 0, 0, 0, 0, // no more block
                 // index
-                0, 0, 0, 0, 0, 0, 0, 0, // fst lenght
+                0, 0, 0, 0, 0, 0, 0, 0, // fst length
                 16, 0, 0, 0, 0, 0, 0, 0, // index start offset
                 3, 0, 0, 0, 0, 0, 0, 0, // num term
                 3, 0, 0, 0, // version

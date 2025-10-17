@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap, BTreeSet, BinaryHeap};
+use std::io;
 use std::ops::Bound;
-use std::{io, u64, usize};
 
 use crate::collector::{Collector, SegmentCollector};
 use crate::fastfield::FacetReader;
@@ -13,7 +13,7 @@ struct Hit<'a> {
     facet: &'a Facet,
 }
 
-impl<'a> Eq for Hit<'a> {}
+impl Eq for Hit<'_> {}
 
 impl<'a> PartialEq<Hit<'a>> for Hit<'a> {
     fn eq(&self, other: &Hit<'_>) -> bool {
@@ -27,7 +27,7 @@ impl<'a> PartialOrd<Hit<'a>> for Hit<'a> {
     }
 }
 
-impl<'a> Ord for Hit<'a> {
+impl Ord for Hit<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .count
@@ -484,7 +484,6 @@ impl FacetCounts {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::iter;
 
     use columnar::Dictionary;
     use rand::distributions::Uniform;
@@ -598,7 +597,7 @@ mod tests {
                 let mid = n % 4;
                 n /= 4;
                 let leaf = n % 5;
-                Facet::from(&format!("/top{}/mid{}/leaf{}", top, mid, leaf))
+                Facet::from(&format!("/top{top}/mid{mid}/leaf{leaf}"))
             })
             .collect();
         for i in 0..num_facets * 10 {
@@ -737,9 +736,9 @@ mod tests {
             vec![("a", 10), ("b", 100), ("c", 7), ("d", 12), ("e", 21)]
                 .into_iter()
                 .flat_map(|(c, count)| {
-                    let facet = Facet::from(&format!("/facet/{}", c));
+                    let facet = Facet::from(&format!("/facet/{c}"));
                     let doc = doc!(facet_field => facet);
-                    iter::repeat(doc).take(count)
+                    std::iter::repeat_n(doc, count)
                 })
                 .map(|mut doc| {
                     doc.add_facet(
@@ -785,9 +784,9 @@ mod tests {
         let docs: Vec<TantivyDocument> = vec![("b", 2), ("a", 2), ("c", 4)]
             .into_iter()
             .flat_map(|(c, count)| {
-                let facet = Facet::from(&format!("/facet/{}", c));
+                let facet = Facet::from(&format!("/facet/{c}"));
                 let doc = doc!(facet_field => facet);
-                iter::repeat(doc).take(count)
+                std::iter::repeat_n(doc, count)
             })
             .collect();
 

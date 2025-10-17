@@ -44,11 +44,14 @@
 //! - [Metric](metric)
 //!     - [Average](metric::AverageAggregation)
 //!     - [Stats](metric::StatsAggregation)
+//!     - [ExtendedStats](metric::ExtendedStatsAggregation)
 //!     - [Min](metric::MinAggregation)
 //!     - [Max](metric::MaxAggregation)
 //!     - [Sum](metric::SumAggregation)
 //!     - [Count](metric::CountAggregation)
 //!     - [Percentiles](metric::PercentilesAggregationReq)
+//!     - [Cardinality](metric::CardinalityAggregationReq)
+//!     - [TopHits](metric::TopHitsAggregationReq)
 //!
 //! # Example
 //! Compute the average metric, by building [`agg_req::Aggregations`], which is built from an
@@ -124,9 +127,10 @@
 //! [`AggregationResults`](agg_result::AggregationResults) via the
 //! [`into_final_result`](intermediate_agg_result::IntermediateAggregationResults::into_final_result) method.
 
+mod accessor_helpers;
+mod agg_data;
 mod agg_limits;
 pub mod agg_req;
-mod agg_req_with_accessor;
 pub mod agg_result;
 pub mod bucket;
 mod buf_collector;
@@ -137,17 +141,14 @@ pub mod intermediate_agg_result;
 pub mod metric;
 
 mod segment_agg_result;
-use std::collections::HashMap;
 use std::fmt::Display;
 
 #[cfg(test)]
 mod agg_tests;
 
-mod agg_bench;
-
 use core::fmt;
 
-pub use agg_limits::AggregationLimits;
+pub use agg_limits::AggregationLimitsGuard;
 pub use collector::{
     AggregationCollector, AggregationSegmentCollector, DistributedAggregationCollector,
     DEFAULT_BUCKET_LIMIT,
@@ -159,20 +160,15 @@ use itertools::Itertools;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub(crate) fn invalid_agg_request(message: String) -> crate::TantivyError {
-    crate::TantivyError::AggregationError(AggregationError::InvalidRequest(message))
-}
-
 fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
-    let parsed = value.parse::<f64>().map_err(|_err| {
-        de::Error::custom(format!("Failed to parse f64 from string: {:?}", value))
-    })?;
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_err| de::Error::custom(format!("Failed to parse f64 from string: {value:?}")))?;
 
     // Check if the parsed value is NaN or infinity
     if parsed.is_nan() || parsed.is_infinite() {
         Err(de::Error::custom(format!(
-            "Value is not a valid f64 (NaN or Infinity): {:?}",
-            value
+            "Value is not a valid f64 (NaN or Infinity): {value:?}"
         )))
     } else {
         Ok(parsed)
@@ -184,7 +180,7 @@ pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = Option<f64>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -230,7 +226,7 @@ pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = f64;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -261,89 +257,21 @@ where D: Deserializer<'de> {
     deserializer.deserialize_any(StringOrFloatVisitor)
 }
 
-/// Represents an associative array `(key => values)` in a very efficient manner.
-#[derive(PartialEq, Serialize, Deserialize)]
-pub(crate) struct VecWithNames<T> {
-    pub(crate) values: Vec<T>,
-    keys: Vec<String>,
-}
-
-impl<T: Clone> Clone for VecWithNames<T> {
-    fn clone(&self) -> Self {
-        Self {
-            values: self.values.clone(),
-            keys: self.keys.clone(),
-        }
-    }
-}
-
-impl<T> Default for VecWithNames<T> {
-    fn default() -> Self {
-        Self {
-            values: Default::default(),
-            keys: Default::default(),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for VecWithNames<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
-    }
-}
-
-impl<T> From<HashMap<String, T>> for VecWithNames<T> {
-    fn from(map: HashMap<String, T>) -> Self {
-        VecWithNames::from_entries(map.into_iter().collect_vec())
-    }
-}
-
-impl<T> VecWithNames<T> {
-    fn from_entries(mut entries: Vec<(String, T)>) -> Self {
-        // Sort to ensure order of elements match across multiple instances
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut data = Vec::with_capacity(entries.len());
-        let mut data_names = Vec::with_capacity(entries.len());
-        for entry in entries {
-            data_names.push(entry.0);
-            data.push(entry.1);
-        }
-        VecWithNames {
-            values: data,
-            keys: data_names,
-        }
-    }
-    fn iter(&self) -> impl Iterator<Item = (&str, &T)> + '_ {
-        self.keys().zip(self.values.iter())
-    }
-    fn keys(&self) -> impl Iterator<Item = &str> + '_ {
-        self.keys.iter().map(|key| key.as_str())
-    }
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> + '_ {
-        self.values.iter_mut()
-    }
-    fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-    fn get(&self, name: &str) -> Option<&T> {
-        self.keys()
-            .position(|key| key == name)
-            .map(|pos| &self.values[pos])
-    }
-}
-
 /// The serialized key is used in a `HashMap`.
 pub type SerializedKey = String;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialOrd)]
 /// The key to identify a bucket.
+///
+/// The order is important, with serde untagged, that we try to deserialize into i64 first.
 #[serde(untagged)]
 pub enum Key {
     /// String key
     Str(String),
+    /// `i64` key
+    I64(i64),
+    /// `u64` key
+    U64(u64),
     /// `f64` key
     F64(f64),
 }
@@ -354,6 +282,8 @@ impl std::hash::Hash for Key {
         match self {
             Key::Str(text) => text.hash(state),
             Key::F64(val) => val.to_bits().hash(state),
+            Key::U64(val) => val.hash(state),
+            Key::I64(val) => val.hash(state),
         }
     }
 }
@@ -362,8 +292,12 @@ impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Str(l), Self::Str(r)) => l == r,
-            (Self::F64(l), Self::F64(r)) => l == r,
-            _ => false,
+            (Self::F64(l), Self::F64(r)) => l.to_bits() == r.to_bits(),
+            (Self::I64(l), Self::I64(r)) => l == r,
+            (Self::U64(l), Self::U64(r)) => l == r,
+            // we list all variant of left operand to make sure this gets updated when we add
+            // variants to the enum
+            (Self::Str(_) | Self::F64(_) | Self::I64(_) | Self::U64(_), _) => false,
         }
     }
 }
@@ -373,6 +307,8 @@ impl Display for Key {
         match self {
             Key::Str(val) => f.write_str(val),
             Key::F64(val) => f.write_str(&val.to_string()),
+            Key::U64(val) => f.write_str(&val.to_string()),
+            Key::I64(val) => f.write_str(&val.to_string()),
         }
     }
 }
@@ -452,7 +388,7 @@ mod tests {
         agg_req: Aggregations,
         index: &Index,
         query: Option<(&str, &str)>,
-        limits: AggregationLimits,
+        limits: AggregationLimitsGuard,
     ) -> crate::Result<Value> {
         let collector = AggregationCollector::from_aggs(agg_req, limits);
 
@@ -572,7 +508,7 @@ mod tests {
             .set_indexing_options(
                 TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
-            .set_fast(None)
+            .set_fast(Some("raw"))
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
         let date_field = schema_builder.add_date_field("date", FAST);

@@ -5,6 +5,7 @@ use std::{io, thread};
 
 use common::{BinarySerializable, CountingWriter, TerminatingWrite};
 
+use super::DOC_STORE_VERSION;
 use crate::directory::WritePtr;
 use crate::store::footer::DocStoreFooter;
 use crate::store::index::{Checkpoint, SkipIndexBuilder};
@@ -143,8 +144,11 @@ impl BlockCompressorImpl {
 
     fn close(mut self) -> io::Result<()> {
         let header_offset: u64 = self.writer.written_bytes();
-        let docstore_footer =
-            DocStoreFooter::new(header_offset, Decompressor::from(self.compressor));
+        let docstore_footer = DocStoreFooter::new(
+            header_offset,
+            Decompressor::from(self.compressor),
+            DOC_STORE_VERSION,
+        );
         self.offset_index_writer.serialize_into(&mut self.writer)?;
         docstore_footer.serialize(&mut self.writer)?;
         self.writer.terminate()
@@ -211,7 +215,7 @@ impl DedicatedThreadBlockCompressorImpl {
     fn send(&mut self, msg: BlockCompressorMessage) -> io::Result<()> {
         if self.tx.send(msg).is_err() {
             harvest_thread_result(self.join_handle.take())?;
-            return Err(io::Error::new(io::ErrorKind::Other, "Unidentified error."));
+            return Err(io::Error::other("Unidentified error."));
         }
         Ok(())
     }
@@ -227,11 +231,10 @@ impl DedicatedThreadBlockCompressorImpl {
 /// If the thread panicked, or if the result has already been harvested,
 /// returns an explicit error.
 fn harvest_thread_result(join_handle_opt: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
-    let join_handle = join_handle_opt
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Thread already joined."))?;
+    let join_handle = join_handle_opt.ok_or_else(|| io::Error::other("Thread already joined."))?;
     join_handle
         .join()
-        .map_err(|_err| io::Error::new(io::ErrorKind::Other, "Compressing thread panicked."))?
+        .map_err(|_err| io::Error::other("Compressing thread panicked."))?
 }
 
 #[cfg(test)]

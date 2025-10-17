@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use std::sync::Arc;
 
 mod set;
@@ -7,11 +7,11 @@ mod set_block;
 use common::{BinarySerializable, OwnedBytes, VInt};
 pub use set::{SelectCursor, Set, SetCodec};
 use set_block::{
-    DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec, DENSE_BLOCK_NUM_BYTES,
+    DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec,
 };
 
 use crate::iterable::Iterable;
-use crate::{DocId, InvalidData, RowId};
+use crate::{DocId, RowId};
 
 /// The threshold for for number of elements after which we switch to dense block encoding.
 ///
@@ -80,17 +80,23 @@ impl BlockVariant {
 /// index is the block index. For each block `byte_start` and `offset` is computed.
 #[derive(Clone)]
 pub struct OptionalIndex {
-    num_rows: RowId,
-    num_non_null_rows: RowId,
+    num_docs: RowId,
+    num_non_null_docs: RowId,
     block_data: OwnedBytes,
     block_metas: Arc<[BlockMeta]>,
 }
 
+impl Iterable<u32> for &OptionalIndex {
+    fn boxed_iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        Box::new(self.iter_non_null_docs())
+    }
+}
+
 impl std::fmt::Debug for OptionalIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("OptionalIndex")
-            .field("num_rows", &self.num_rows)
-            .field("num_non_null_rows", &self.num_non_null_rows)
+            .field("num_docs", &self.num_docs)
+            .field("num_non_null_docs", &self.num_non_null_docs)
             .finish_non_exhaustive()
     }
 }
@@ -117,7 +123,7 @@ enum BlockSelectCursor<'a> {
     Sparse(<SparseBlock<'a> as Set<u16>>::SelectCursor<'a>),
 }
 
-impl<'a> BlockSelectCursor<'a> {
+impl BlockSelectCursor<'_> {
     fn select(&mut self, rank: u16) -> u16 {
         match self {
             BlockSelectCursor::Dense(dense_select_cursor) => dense_select_cursor.select(rank),
@@ -135,7 +141,7 @@ pub struct OptionalIndexSelectCursor<'a> {
     num_null_rows_before_block: RowId,
 }
 
-impl<'a> OptionalIndexSelectCursor<'a> {
+impl OptionalIndexSelectCursor<'_> {
     fn search_and_load_block(&mut self, rank: RowId) {
         if rank < self.current_block_end_rank {
             // we are already in the right block
@@ -159,7 +165,7 @@ impl<'a> OptionalIndexSelectCursor<'a> {
     }
 }
 
-impl<'a> SelectCursor<RowId> for OptionalIndexSelectCursor<'a> {
+impl SelectCursor<RowId> for OptionalIndexSelectCursor<'_> {
     fn select(&mut self, rank: RowId) -> RowId {
         self.search_and_load_block(rank);
         let index_in_block = (rank - self.num_null_rows_before_block) as u16;
@@ -168,7 +174,9 @@ impl<'a> SelectCursor<RowId> for OptionalIndexSelectCursor<'a> {
 }
 
 impl Set<RowId> for OptionalIndex {
-    type SelectCursor<'b> = OptionalIndexSelectCursor<'b> where Self: 'b;
+    type SelectCursor<'b>
+        = OptionalIndexSelectCursor<'b>
+    where Self: 'b;
     // Check if value at position is not null.
     #[inline]
     fn contains(&self, row_id: RowId) -> bool {
@@ -196,6 +204,7 @@ impl Set<RowId> for OptionalIndex {
         } = row_addr_from_row_id(doc_id);
         let block_meta = self.block_metas[block_id as usize];
         let block = self.block(block_meta);
+
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank(in_block_row_id),
@@ -250,11 +259,13 @@ impl Set<RowId> for OptionalIndex {
 
 impl OptionalIndex {
     pub fn for_test(num_rows: RowId, row_ids: &[RowId]) -> OptionalIndex {
-        assert!(row_ids
-            .last()
-            .copied()
-            .map(|last_row_id| last_row_id < num_rows)
-            .unwrap_or(true));
+        assert!(
+            row_ids
+                .last()
+                .copied()
+                .map(|last_row_id| last_row_id < num_rows)
+                .unwrap_or(true)
+        );
         let mut buffer = Vec::new();
         serialize_optional_index(&row_ids, num_rows, &mut buffer).unwrap();
         let bytes = OwnedBytes::new(buffer);
@@ -262,17 +273,18 @@ impl OptionalIndex {
     }
 
     pub fn num_docs(&self) -> RowId {
-        self.num_rows
+        self.num_docs
     }
 
     pub fn num_non_nulls(&self) -> RowId {
-        self.num_non_null_rows
+        self.num_non_null_docs
     }
 
-    pub fn iter_rows(&self) -> impl Iterator<Item = RowId> + '_ {
-        // TODO optimize
+    pub fn iter_non_null_docs(&self) -> impl Iterator<Item = RowId> + '_ {
+        // TODO optimize. We could iterate over the blocks directly.
+        // We use the dense value ids and retrieve the doc ids via select.
         let mut select_batch = self.select_cursor();
-        (0..self.num_non_null_rows).map(move |rank| select_batch.select(rank))
+        (0..self.num_non_null_docs).map(move |rank| select_batch.select(rank))
     }
     pub fn select_batch(&self, ranks: &mut [RowId]) {
         let mut select_cursor = self.select_cursor();
@@ -321,38 +333,6 @@ impl OptionalIndex {
 enum Block<'a> {
     Dense(DenseBlock<'a>),
     Sparse(SparseBlock<'a>),
-}
-
-#[derive(Debug, Copy, Clone)]
-enum OptionalIndexCodec {
-    Dense = 0,
-    Sparse = 1,
-}
-
-impl OptionalIndexCodec {
-    fn to_code(self) -> u8 {
-        self as u8
-    }
-
-    fn try_from_code(code: u8) -> Result<Self, InvalidData> {
-        match code {
-            0 => Ok(Self::Dense),
-            1 => Ok(Self::Sparse),
-            _ => Err(InvalidData),
-        }
-    }
-}
-
-impl BinarySerializable for OptionalIndexCodec {
-    fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&[self.to_code()])
-    }
-
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let optional_codec_code = u8::deserialize(reader)?;
-        let optional_codec = Self::try_from_code(optional_codec_code)?;
-        Ok(optional_codec)
-    }
 }
 
 fn serialize_optional_index_block(block_els: &[u16], out: &mut impl io::Write) -> io::Result<()> {
@@ -496,7 +476,7 @@ fn deserialize_optional_index_block_metadatas(
         non_null_rows_before_block += num_non_null_rows;
     }
     block_metas.resize(
-        ((num_rows + ELEMENTS_PER_BLOCK - 1) / ELEMENTS_PER_BLOCK) as usize,
+        num_rows.div_ceil(ELEMENTS_PER_BLOCK) as usize,
         BlockMeta {
             non_null_rows_before_block,
             start_byte_offset,
@@ -510,15 +490,15 @@ pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
     let (mut bytes, num_non_empty_blocks_bytes) = bytes.rsplit(2);
     let num_non_empty_block_bytes =
         u16::from_le_bytes(num_non_empty_blocks_bytes.as_slice().try_into().unwrap());
-    let num_rows = VInt::deserialize_u64(&mut bytes)? as u32;
+    let num_docs = VInt::deserialize_u64(&mut bytes)? as u32;
     let block_metas_num_bytes =
         num_non_empty_block_bytes as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
     let (block_data, block_metas) = bytes.rsplit(block_metas_num_bytes);
-    let (block_metas, num_non_null_rows) =
-        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_rows);
+    let (block_metas, num_non_null_docs) =
+        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_docs);
     let optional_index = OptionalIndex {
-        num_rows,
-        num_non_null_rows,
+        num_docs,
+        num_non_null_docs,
         block_data,
         block_metas: block_metas.into(),
     };

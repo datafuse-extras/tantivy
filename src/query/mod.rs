@@ -5,6 +5,7 @@ mod bm25;
 mod boolean_query;
 mod boost_query;
 mod const_score_query;
+mod disjunction;
 mod disjunction_max_query;
 mod empty_query;
 mod exclude;
@@ -22,6 +23,7 @@ mod regex_query;
 mod reqopt_scorer;
 mod scorer;
 mod set_query;
+mod size_hint;
 mod term_query;
 mod union;
 mod weight;
@@ -50,19 +52,18 @@ pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::{intersect_scorers, Intersection};
 pub use self::more_like_this::{MoreLikeThisQuery, MoreLikeThisQueryBuilder};
 pub use self::phrase_prefix_query::PhrasePrefixQuery;
+pub use self::phrase_query::regex_phrase_query::{wildcard_query_to_regex_str, RegexPhraseQuery};
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
-pub use self::range_query::{FastFieldRangeWeight, IPFastFieldRangeWeight, RangeQuery};
+pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
-pub use self::score_combiner::{
-    DisjunctionMaxCombiner, ScoreCombiner, SumCombiner, SumWithCoordsCombiner,
-};
+pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
 pub use self::scorer::Scorer;
 pub use self::set_query::TermSetQuery;
 pub use self::term_query::TermQuery;
-pub use self::union::Union;
+pub use self::union::BufferedUnionScorer;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
 pub use self::weight::Weight;
@@ -104,7 +105,7 @@ mod tests {
             let query = query_parser.parse_query("a a a a a").unwrap();
             let mut terms = Vec::new();
             query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false); 5], terms);
+            assert_eq!(vec![(&term_a, false); 1], terms);
         }
         {
             let query = query_parser.parse_query("a -b").unwrap();

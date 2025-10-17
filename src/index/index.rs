@@ -3,7 +3,7 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::thread::available_parallelism;
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
@@ -15,7 +15,9 @@ use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
-use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
+use crate::indexer::index_writer::{
+    IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
+};
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
@@ -49,10 +51,8 @@ fn load_metas(
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
-///  - it fails, in which case an error is returned,
-/// and the `meta.json` remains untouched,
-/// - it succeeds, and `meta.json` is written
-/// and flushed.
+/// - it fails, in which case an error is returned, and the `meta.json` remains untouched,
+/// - it succeeds, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
 fn save_new_metas(
@@ -216,7 +216,7 @@ impl IndexBuilder {
 
     /// Opens or creates a new index in the provided directory
     pub fn open_or_create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
-        let dir = dir.into();
+        let dir: Box<dyn Directory> = dir.into();
         if !Index::exists(&*dir)? {
             return self.create(dir);
         }
@@ -232,23 +232,7 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
-        if let Some(schema) = self.schema.as_ref() {
-            if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
-                let schema_field = schema.get_field(&sort_by_field.field).map_err(|_| {
-                    TantivyError::InvalidArgument(format!(
-                        "Field to sort index {} not found in schema",
-                        sort_by_field.field
-                    ))
-                })?;
-                let entry = schema.get_field_entry(schema_field);
-                if !entry.is_fast() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "Field {} is no fast field. Field needs to be a single value fast field \
-                         to be used to sort an index",
-                        sort_by_field.field
-                    )));
-                }
-            }
+        if let Some(_schema) = self.schema.as_ref() {
             Ok(())
         } else {
             Err(TantivyError::InvalidArgument(
@@ -284,7 +268,7 @@ pub struct Index {
     directory: ManagedDirectory,
     schema: Schema,
     settings: IndexSettings,
-    executor: Arc<Executor>,
+    executor: Executor,
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
@@ -309,29 +293,25 @@ impl Index {
     ///
     /// By default the executor is single thread, and simply runs in the calling thread.
     pub fn search_executor(&self) -> &Executor {
-        self.executor.as_ref()
+        &self.executor
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with a given number of threads.
     pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
-        self.executor = Arc::new(Executor::multi_thread(num_threads, "tantivy-search-")?);
+        self.executor = Executor::multi_thread(num_threads, "tantivy-search-")?;
         Ok(())
     }
 
     /// Custom thread pool by a outer thread pool.
-    pub fn set_shared_multithread_executor(
-        &mut self,
-        shared_thread_pool: Arc<Executor>,
-    ) -> crate::Result<()> {
-        self.executor = shared_thread_pool.clone();
-        Ok(())
+    pub fn set_executor(&mut self, executor: Executor) {
+        self.executor = executor;
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with as many threads as there are CPUs on the system.
     pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
-        let default_num_threads = num_cpus::get();
+        let default_num_threads = available_parallelism()?.get();
         self.set_multithread_executor(default_num_threads)
     }
 
@@ -409,7 +389,7 @@ impl Index {
             schema,
             tokenizers: TokenizerManager::default(),
             fast_field_tokenizers: TokenizerManager::default(),
-            executor: Arc::new(Executor::single_thread()),
+            executor: Executor::single_thread(),
             inventory,
         }
     }
@@ -514,7 +494,7 @@ impl Index {
             .into_iter()
             .map(|segment| SegmentReader::open(&segment)?.fields_metadata())
             .collect::<Result<_, _>>()?;
-        Ok(merge_field_meta_data(fields_metadata, &self.schema()))
+        Ok(merge_field_meta_data(fields_metadata))
     }
 
     /// Creates a new segment_meta (Advanced user only).
@@ -541,7 +521,7 @@ impl Index {
         load_metas(self.directory(), &self.inventory)
     }
 
-    /// Open a new index writer. Attempts to acquire a lockfile.
+    /// Open a new index writer with the given options. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
     /// that due to a panic or other error, a stale lockfile will be
@@ -549,21 +529,16 @@ impl Index {
     /// `IndexWriter` on the system is accessing the index directory,
     /// it is safe to manually delete the lockfile.
     ///
-    /// - `num_threads` defines the number of indexing workers that
-    /// should work at the same time.
-    ///
-    /// - `overall_memory_budget_in_bytes` sets the amount of memory
-    /// allocated for all indexing thread.
-    /// Each thread will receive a budget of  `overall_memory_budget_in_bytes / num_threads`.
+    /// - `options` defines the writer configuration which includes things like buffer sizes,
+    ///   indexer threads, etc...
     ///
     /// # Errors
-    /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
+    /// If the lockfile already exists, returns `TantivyError::LockFailure`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer_with_num_threads<D: Document>(
+    pub fn writer_with_options<D: Document>(
         &self,
-        num_threads: usize,
-        overall_memory_budget_in_bytes: usize,
+        options: IndexWriterOptions,
     ) -> crate::Result<IndexWriter<D>> {
         let directory_lock = self
             .directory
@@ -579,13 +554,40 @@ impl Index {
                     ),
                 )
             })?;
+
+        IndexWriter::new(self, options, directory_lock)
+    }
+
+    /// Open a new index writer. Attempts to acquire a lockfile.
+    ///
+    /// The lockfile should be deleted on drop, but it is possible
+    /// that due to a panic or other error, a stale lockfile will be
+    /// left in the index directory. If you are sure that no other
+    /// `IndexWriter` on the system is accessing the index directory,
+    /// it is safe to manually delete the lockfile.
+    ///
+    /// - `num_threads` defines the number of indexing workers that should work at the same time.
+    ///
+    /// - `overall_memory_budget_in_bytes` sets the amount of memory allocated for all indexing
+    ///   thread.
+    ///
+    /// Each thread will receive a budget of `overall_memory_budget_in_bytes / num_threads`.
+    ///
+    /// # Errors
+    /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
+    /// If the memory arena per thread is too small or too big, returns
+    /// `TantivyError::InvalidArgument`
+    pub fn writer_with_num_threads<D: Document>(
+        &self,
+        num_threads: usize,
+        overall_memory_budget_in_bytes: usize,
+    ) -> crate::Result<IndexWriter<D>> {
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
-        IndexWriter::new(
-            self,
-            num_threads,
-            memory_arena_in_bytes_per_thread,
-            directory_lock,
-        )
+        let options = IndexWriterOptions::builder()
+            .num_worker_threads(num_threads)
+            .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
+            .build();
+        self.writer_with_options(options)
     }
 
     /// Helper to create an index writer for tests.
@@ -612,7 +614,7 @@ impl Index {
         &self,
         memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
-        let mut num_threads = std::cmp::min(num_cpus::get(), MAX_NUM_THREAD);
+        let mut num_threads = std::cmp::min(available_parallelism()?.get(), MAX_NUM_THREAD);
         let memory_budget_num_bytes_per_thread = memory_budget_in_bytes / num_threads;
         if memory_budget_num_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             num_threads = (memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);

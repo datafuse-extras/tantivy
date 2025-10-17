@@ -25,8 +25,8 @@
 //! Most users should not access the `StoreReader` directly
 //! and should rely on either
 //!
-//! - at the segment level, the
-//! [`SegmentReader`'s `doc` method](../struct.SegmentReader.html#method.doc)
+//! - at the segment level, the [`SegmentReader`'s `doc`
+//!   method](../struct.SegmentReader.html#method.doc)
 //! - at the index level, the [`Searcher::doc()`](crate::Searcher::doc) method
 
 mod compressors;
@@ -35,15 +35,16 @@ mod footer;
 mod index;
 mod reader;
 mod writer;
+
 pub use self::compressors::{Compressor, ZstdCompressor};
 pub use self::decompressors::Decompressor;
-pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
+pub(crate) use self::reader::{DocStoreVersion, DOCSTORE_CACHE_CAPACITY};
 pub use self::writer::StoreWriter;
 mod store_compressor;
 
 /// Doc store version in footer to handle format changes.
-pub(crate) const DOC_STORE_VERSION: u32 = 1;
+pub(crate) const DOC_STORE_VERSION: DocStoreVersion = DocStoreVersion::V2;
 
 #[cfg(feature = "lz4-compression")]
 mod compression_lz4_block;
@@ -52,16 +53,15 @@ mod compression_lz4_block;
 mod compression_zstd_block;
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
 
     use std::path::Path;
 
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
     use crate::fastfield::AliveBitSet;
-    use crate::schema::document::Value;
     use crate::schema::{
-        self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, STORED, TEXT,
+        self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value, STORED, TEXT,
     };
     use crate::{Index, IndexWriter, Term};
 
@@ -92,8 +92,8 @@ pub mod tests {
                 StoreWriter::new(writer, compressor, blocksize, separate_thread).unwrap();
             for i in 0..num_docs {
                 let mut doc = TantivyDocument::default();
-                doc.add_field_value(field_body, LOREM.to_string());
-                doc.add_field_value(field_title, format!("Doc {i}"));
+                doc.add_text(field_body, LOREM);
+                doc.add_text(field_title, format!("Doc {i}"));
                 store_writer.store(&doc, &schema).unwrap();
             }
             store_writer.close().unwrap();
@@ -119,10 +119,11 @@ pub mod tests {
         let store = StoreReader::open(store_file, 10)?;
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
-                *store
+                store
                     .get::<TantivyDocument>(i)?
                     .get_first(field_title)
                     .unwrap()
+                    .as_value()
                     .as_str()
                     .unwrap(),
                 format!("Doc {i}")
@@ -131,7 +132,13 @@ pub mod tests {
 
         for doc in store.iter::<TantivyDocument>(Some(&alive_bitset)) {
             let doc = doc?;
-            let title_content = doc.get_first(field_title).unwrap().as_str().unwrap();
+            let title_content = doc
+                .get_first(field_title)
+                .unwrap()
+                .as_value()
+                .as_str()
+                .unwrap()
+                .to_string();
             if !title_content.starts_with("Doc ") {
                 panic!("unexpected title_content {title_content}");
             }

@@ -39,7 +39,7 @@ impl RetryPolicy {
 /// The `DirectoryLock` is an object that represents a file lock.
 ///
 /// It is associated with a lock file, that gets deleted on `Drop.`
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct DirectoryLock(Box<dyn Send + Sync + 'static>);
 
 struct DirectoryLockGuard {
@@ -56,7 +56,7 @@ impl<T: Send + Sync + 'static> From<Box<T>> for DirectoryLock {
 impl Drop for DirectoryLockGuard {
     fn drop(&mut self) {
         if let Err(e) = self.directory.delete(&self.path) {
-            error!("Failed to remove the lock file. {:?}", e);
+            error!("Failed to remove the lock file. {e:?}");
         }
     }
 }
@@ -102,10 +102,8 @@ fn retry_policy(is_blocking: bool) -> RetryPolicy {
 ///
 /// There are currently two implementations of `Directory`
 ///
-/// - The [`MMapDirectory`][crate::directory::MmapDirectory], this
-/// should be your default choice.
-/// - The [`RamDirectory`][crate::directory::RamDirectory], which
-/// should be used mostly for tests.
+/// - The [`MMapDirectory`][crate::directory::MmapDirectory], this should be your default choice.
+/// - The [`RamDirectory`][crate::directory::RamDirectory], which should be used mostly for tests.
 pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Opens a file and returns a boxed `FileHandle`.
     ///

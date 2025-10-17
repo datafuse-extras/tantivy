@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
 
 use common::StableDeref;
-use fs4::FileExt;
+use fs4::fs_std::FileExt;
 #[cfg(all(feature = "mmap", unix))]
 pub use memmap2::Advice;
 use memmap2::Mmap;
@@ -29,7 +29,7 @@ pub type WeakArcBytes = Weak<dyn Deref<Target = [u8]> + Send + Sync + 'static>;
 
 /// Create a default io error given a string.
 pub(crate) fn make_io_err(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, msg)
+    io::Error::other(msg)
 }
 
 /// Returns `None` iff the file exists, can be read, but is empty (and hence
@@ -244,7 +244,7 @@ impl MmapDirectory {
                 directory_path,
             )));
         }
-        #[allow(clippy::bind_instead_of_map)]
+        #[expect(clippy::bind_instead_of_map)]
         let canonical_path: PathBuf = directory_path.canonicalize().or_else(|io_err| {
             let directory_path = directory_path.to_owned();
 
@@ -369,7 +369,7 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 
 impl Directory for MmapDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        debug!("Open Read {:?}", path);
+        debug!("Open Read {path:?}");
         let full_path = self.resolve_path(path);
 
         let mut mmap_cache = self.inner.mmap_cache.write().map_err(|_| {
@@ -414,7 +414,7 @@ impl Directory for MmapDirectory {
     }
 
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        debug!("Open Write {:?}", path);
+        debug!("Open Write {path:?}");
         let full_path = self.resolve_path(path);
 
         let open_res = OpenOptions::new()
@@ -467,7 +467,7 @@ impl Directory for MmapDirectory {
     }
 
     fn atomic_write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
-        debug!("Atomic Write {:?}", path);
+        debug!("Atomic Write {path:?}");
         let full_path = self.resolve_path(path);
         atomic_write(&full_path, content)?;
         Ok(())
@@ -484,8 +484,8 @@ impl Directory for MmapDirectory {
             .map_err(LockError::wrap_io_error)?;
         if lock.is_blocking {
             file.lock_exclusive().map_err(LockError::wrap_io_error)?;
-        } else {
-            file.try_lock_exclusive().map_err(|_| LockError::LockBusy)?
+        } else if !file.try_lock_exclusive().map_err(|_| LockError::LockBusy)? {
+            return Err(LockError::LockBusy);
         }
         // dropping the file handle will release the lock.
         Ok(DirectoryLock::from(Box::new(ReleaseLockFile {
@@ -566,7 +566,7 @@ mod tests {
         let mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
         let num_paths = 10;
         let paths: Vec<PathBuf> = (0..num_paths)
-            .map(|i| PathBuf::from(&*format!("file_{}", i)))
+            .map(|i| PathBuf::from(&*format!("file_{i}")))
             .collect();
         {
             for path in &paths {

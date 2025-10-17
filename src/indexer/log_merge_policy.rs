@@ -104,7 +104,7 @@ impl MergePolicy for LogMergePolicy {
 
         let mut current_max_log_size = f64::MAX;
         let mut levels = vec![];
-        for (_, merge_group) in &size_sorted_segments.into_iter().group_by(|segment| {
+        for (_, merge_group) in &size_sorted_segments.into_iter().chunk_by(|segment| {
             let segment_log_size = f64::from(self.clip_min_size(segment.num_docs())).log2();
             if segment_log_size < (current_max_log_size - self.level_log_size) {
                 // update current_max_log_size to create a new group
@@ -144,9 +144,9 @@ mod tests {
     use once_cell::sync::Lazy;
 
     use super::*;
-    use crate::index::SegmentMetaInventory;
+    use crate::index::{SegmentId, SegmentMetaInventory};
+    use crate::schema;
     use crate::schema::INDEXED;
-    use crate::{schema, SegmentId};
 
     static INVENTORY: Lazy<SegmentMetaInventory> = Lazy::new(SegmentMetaInventory::default);
 

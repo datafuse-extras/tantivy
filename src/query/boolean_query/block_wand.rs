@@ -167,7 +167,7 @@ pub fn block_wand(
         let block_max_score_upperbound: Score = scorers[..pivot_len]
             .iter_mut()
             .map(|scorer| {
-                scorer.shallow_seek(pivot_doc);
+                scorer.seek_block(pivot_doc);
                 scorer.block_max_score()
             })
             .sum();
@@ -234,7 +234,7 @@ pub fn block_wand_single_scorer(
                 return;
             }
             doc = last_doc_in_block + 1;
-            scorer.shallow_seek(doc);
+            scorer.seek_block(doc);
         }
         // Seek will effectively load that block.
         doc = scorer.seek(doc);
@@ -256,7 +256,7 @@ pub fn block_wand_single_scorer(
             }
         }
         doc += 1;
-        scorer.shallow_seek(doc);
+        scorer.seek_block(doc);
     }
 }
 
@@ -272,7 +272,7 @@ impl<'a> From<&'a mut TermScorer> for TermScorerWithMaxScore<'a> {
     }
 }
 
-impl<'a> Deref for TermScorerWithMaxScore<'a> {
+impl Deref for TermScorerWithMaxScore<'_> {
     type Target = TermScorer;
 
     fn deref(&self) -> &Self::Target {
@@ -280,7 +280,7 @@ impl<'a> Deref for TermScorerWithMaxScore<'a> {
     }
 }
 
-impl<'a> DerefMut for TermScorerWithMaxScore<'a> {
+impl DerefMut for TermScorerWithMaxScore<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.scorer
     }
@@ -302,13 +302,12 @@ fn is_sorted<I: Iterator<Item = DocId>>(mut it: I) -> bool {
 mod tests {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
-    use std::iter;
 
     use proptest::prelude::*;
 
     use crate::query::score_combiner::SumCombiner;
     use crate::query::term_query::TermScorer;
-    use crate::query::{Bm25Weight, Scorer, Union};
+    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
     struct Float(Score);
@@ -368,10 +367,14 @@ mod tests {
         checkpoints
     }
 
-    fn compute_checkpoints_manual(term_scorers: Vec<TermScorer>, n: usize) -> Vec<(DocId, Score)> {
+    fn compute_checkpoints_manual(
+        term_scorers: Vec<TermScorer>,
+        n: usize,
+        max_doc: u32,
+    ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
-        let mut scorer = Union::build(term_scorers, SumCombiner::default);
+        let mut scorer = BufferedUnionScorer::build(term_scorers, SumCombiner::default, max_doc);
 
         let mut limit = Score::MIN;
         loop {
@@ -417,7 +420,7 @@ mod tests {
             .boxed()
     }
 
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn gen_term_scorers(num_scorers: usize) -> BoxedStrategy<(Vec<Vec<(DocId, u32)>>, Vec<u32>)> {
         (1u32..100u32)
             .prop_flat_map(move |max_doc: u32| {
@@ -436,7 +439,7 @@ mod tests {
         let fieldnorms_expanded = fieldnorms
             .iter()
             .cloned()
-            .flat_map(|fieldnorm| iter::repeat(fieldnorm).take(REPEAT))
+            .flat_map(|fieldnorm| std::iter::repeat_n(fieldnorm, REPEAT))
             .collect::<Vec<u32>>();
 
         let postings_lists_expanded: Vec<Vec<(DocId, u32)>> = posting_lists
@@ -479,7 +482,8 @@ mod tests {
         for top_k in 1..4 {
             let checkpoints_for_each_pruning =
                 compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
-            let checkpoints_manual = compute_checkpoints_manual(term_scorers.clone(), top_k);
+            let checkpoints_manual =
+                compute_checkpoints_manual(term_scorers.clone(), top_k, 100_000);
             assert_eq!(checkpoints_for_each_pruning.len(), checkpoints_manual.len());
             for (&(left_doc, left_score), &(right_doc, right_score)) in checkpoints_for_each_pruning
                 .iter()

@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::io;
 
 use common::file_slice::FileSlice;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tantivy_sstable::{Dictionary, MonotonicU64SSTable};
 
-const CHARSET: &'static [u8] = b"abcdefghij";
+const CHARSET: &[u8] = b"abcdefghij";
 
 fn generate_key(rng: &mut impl Rng) -> String {
     let len = rng.gen_range(3..12);
