@@ -24,7 +24,7 @@ impl SortKeyComputer for SortBySimilarityScore {
         Ok(SortBySimilarityScore)
     }
 
-    // Sorting by score is special in that it allows for the Block-Wand optimization.
+    // Sorting by score is special in that it allows for dynamic pruning (block-max MaxScore).
     fn collect_segment_top_k(
         &self,
         k: usize,
@@ -46,6 +46,30 @@ impl SortKeyComputer for SortBySimilarityScore {
                 threshold = top_n.threshold.unwrap_or(Score::MIN);
                 threshold
             })?;
+        } else if k > 0 {
+            // A heap of the k best gives the scorer the exact k-th score after every document,
+            // instead of the k-th score at the last truncation of the 2k buffer: the pruning
+            // scorers skip more with a tighter threshold. Ties: the earlier (smaller) doc wins, as
+            // with the strict comparison of `TopNComputer::push`.
+            let mut heap: std::collections::BinaryHeap<WorstFirst> =
+                std::collections::BinaryHeap::with_capacity(k + 1);
+            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
+                if heap.len() < k {
+                    heap.push(WorstFirst(score, doc));
+                } else if let Some(mut worst) = heap.peek_mut() {
+                    if score > worst.0 {
+                        *worst = WorstFirst(score, doc);
+                    }
+                }
+                if heap.len() == k {
+                    heap.peek().map_or(Score::MIN, |worst| worst.0)
+                } else {
+                    Score::MIN
+                }
+            })?;
+            for WorstFirst(score, doc) in heap {
+                top_n.push(score, doc);
+            }
         } else {
             weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
                 top_n.push(score, doc);
@@ -73,5 +97,34 @@ impl SegmentSortKeyComputer for SortBySimilarityScore {
 
     fn convert_segment_sort_key(&self, score: Score) -> Score {
         score
+    }
+}
+
+/// A top-k entry ordered so that the max-heap's top is the worst entry: the lowest score, and for
+/// equal scores the larger doc.
+#[derive(Clone, Copy, Debug)]
+struct WorstFirst(Score, DocId);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for WorstFirst {}
+
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .partial_cmp(&self.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.1.cmp(&other.1))
     }
 }

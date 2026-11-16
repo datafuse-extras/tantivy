@@ -2,7 +2,7 @@ mod block_wand;
 mod boolean_query;
 mod boolean_weight;
 
-pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
+pub(crate) use self::block_wand::{block_max_maxscore, block_wand_single_scorer};
 pub use self::boolean_query::BooleanQuery;
 pub use self::boolean_weight::BooleanWeight;
 
