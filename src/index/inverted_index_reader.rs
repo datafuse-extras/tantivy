@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io;
+use std::sync::RwLock;
 
 use common::json_path_writer::JSON_END_OF_PATH;
 use common::{BinarySerializable, ByteCount};
@@ -29,6 +31,7 @@ use crate::termdict::TermDictionary;
 /// [`SegmentReader::inverted_index()`](crate::SegmentReader::inverted_index).
 pub struct InvertedIndexReader {
     termdict: TermDictionary,
+    term_infos: TermInfoMemo,
     postings_file_slice: FileSlice,
     positions_file_slice: FileSlice,
     record_option: IndexRecordOption,
@@ -73,6 +76,7 @@ impl InvertedIndexReader {
         let total_num_tokens = u64::deserialize(&mut total_num_tokens_slice.read_bytes()?)?;
         Ok(InvertedIndexReader {
             termdict,
+            term_infos: TermInfoMemo::default(),
             postings_file_slice: postings_body,
             positions_file_slice,
             record_option,
@@ -85,6 +89,7 @@ impl InvertedIndexReader {
     pub fn empty(record_option: IndexRecordOption) -> InvertedIndexReader {
         InvertedIndexReader {
             termdict: TermDictionary::empty(),
+            term_infos: TermInfoMemo::default(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: FileSlice::empty(),
             record_option,
@@ -93,8 +98,17 @@ impl InvertedIndexReader {
     }
 
     /// Returns the term info associated with the term.
+    ///
+    /// The term infos looked up are remembered, so a query that needs a term several times (its
+    /// document frequency, then its postings) decodes its dictionary block once.
     pub fn get_term_info(&self, term: &Term) -> io::Result<Option<TermInfo>> {
-        self.termdict.get(term.serialized_value_bytes())
+        let key = term.serialized_value_bytes();
+        if let Some(term_info) = self.term_infos.get(key) {
+            return Ok(term_info);
+        }
+        let term_info = self.termdict.get(key)?;
+        self.term_infos.insert(key, &term_info);
+        Ok(term_info)
     }
 
     /// Return the term dictionary datastructure.
@@ -284,7 +298,13 @@ impl InvertedIndexReader {
 #[cfg(feature = "quickwit")]
 impl InvertedIndexReader {
     pub(crate) async fn get_term_info_async(&self, term: &Term) -> io::Result<Option<TermInfo>> {
-        self.termdict.get_async(term.serialized_value_bytes()).await
+        let key = term.serialized_value_bytes();
+        if let Some(term_info) = self.term_infos.get(key) {
+            return Ok(term_info);
+        }
+        let term_info = self.termdict.get_async(key).await?;
+        self.term_infos.insert(key, &term_info);
+        Ok(term_info)
     }
 
     async fn get_term_range_async<'a, A: Automaton + 'a>(
@@ -490,5 +510,112 @@ impl InvertedIndexReader {
             .await?
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
+    }
+}
+
+/// The term infos an [`InvertedIndexReader`] looked up, absent terms included, by serialized term.
+///
+/// The dictionary of a segment never changes, so a remembered term info stays valid for the
+/// lifetime of the reader. At most `limit` terms are remembered; past that, lookups go to the
+/// dictionary.
+struct TermInfoMemo {
+    term_infos: RwLock<HashMap<Vec<u8>, Option<TermInfo>>>,
+    limit: usize,
+}
+
+impl TermInfoMemo {
+    /// The number of terms a reader remembers by default.
+    const DEFAULT_LIMIT: usize = 65_536;
+
+    fn with_limit(limit: usize) -> TermInfoMemo {
+        TermInfoMemo {
+            term_infos: RwLock::new(HashMap::new()),
+            limit,
+        }
+    }
+
+    fn get(&self, term: &[u8]) -> Option<Option<TermInfo>> {
+        self.term_infos
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(term)
+            .cloned()
+    }
+
+    fn insert(&self, term: &[u8], term_info: &Option<TermInfo>) {
+        let mut term_infos = self
+            .term_infos
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if term_infos.len() < self.limit {
+            term_infos.insert(term.to_vec(), term_info.clone());
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.term_infos
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+impl Default for TermInfoMemo {
+    fn default() -> TermInfoMemo {
+        TermInfoMemo::with_limit(TermInfoMemo::DEFAULT_LIMIT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TermInfoMemo;
+    use crate::postings::TermInfo;
+    use crate::schema::{Schema, TEXT};
+    use crate::{Index, IndexWriter, Term};
+
+    #[test]
+    fn test_get_term_info_remembers_lookups() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(text => "a b b"))?;
+        writer.add_document(doc!(text => "b c"))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let inverted_index = searcher.segment_reader(0).inverted_index(text)?;
+        for word in ["a", "b", "c", "missing", "b", "missing"] {
+            let term = Term::from_field_text(text, word);
+            let direct = inverted_index.terms().get(term.serialized_value_bytes())?;
+            assert_eq!(inverted_index.get_term_info(&term)?, direct, "{word}");
+        }
+        // Absent terms are remembered too.
+        assert_eq!(inverted_index.term_infos.len(), 4);
+        let term = Term::from_field_text(text, "b");
+        assert_eq!(
+            inverted_index
+                .get_term_info(&term)?
+                .map(|info| info.doc_freq),
+            Some(2)
+        );
+        assert_eq!(
+            inverted_index.doc_freq(&Term::from_field_text(text, "missing"))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_term_info_memo_limit() {
+        let memo = TermInfoMemo::with_limit(2);
+        let term_info = Some(TermInfo::default());
+        memo.insert(b"a", &term_info);
+        memo.insert(b"b", &None);
+        memo.insert(b"c", &term_info);
+        assert_eq!(memo.len(), 2);
+        assert_eq!(memo.get(b"a"), Some(term_info));
+        assert_eq!(memo.get(b"b"), Some(None));
+        assert_eq!(memo.get(b"c"), None);
     }
 }
